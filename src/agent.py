@@ -2,7 +2,9 @@
 
 from mcp import ClientSession
 from openai import AsyncOpenAI
+from openai.types.responses import ResponseInputParam
 
+from .conversation import Conversation
 from .mcp_client import list_weather_tools
 from .tool_adapter import (
     parse_tool_arguments,
@@ -17,40 +19,59 @@ INSTRUCTIONS = (
     "Для погодных вопросов используй MCP-инструменты. "
     "Сначала найди координаты города, затем получи погоду. "
     "Не придумывай погодные данные. Если данных нет, сообщи об этом. "
-    "Если город неоднозначен, уточни населённый пункт. "
+    "Для связанных вопросов («А завтра?», «А вечером?») учитывай город, "
+    "который был однозначно выбран в диалоге. "
+    "Если подходящий город неизвестен или неоднозначен, попроси уточнение. "
+    "Учитывай уточнение пользователя при ответе на исходный вопрос о погоде. "
     "Учитывай часовой пояс и дату прогноза."
 )
 
 
 async def run_agent(
-    session: ClientSession, client: AsyncOpenAI, *, model: str, question: str
+    session: ClientSession,
+    client: AsyncOpenAI,
+    *,
+    model: str,
+    question: str,
+    conversation: Conversation | None = None,
 ) -> str:
-    """Обрабатывает один вопрос в пределах открытой MCP-сессии."""
+    """Обрабатывает вопрос и сохраняет обмен после получения полного ответа."""
+
+    if conversation is None:
+        conversation = Conversation()
+    revision, history = conversation.snapshot()
+    turn: ResponseInputParam = [{"role": "user", "content": question}]
 
     tools = await list_weather_tools(session)
     function_tools = [to_function_tool(tool) for tool in tools.values()]
-    history = [{"role": "user", "content": question}]
 
     for step in range(1, MAX_STEPS + 1):
         response = await client.responses.create(
             model=model,
             instructions=INSTRUCTIONS,
-            input=history,
+            input=[*history, *turn],
             tools=function_tools,
+            store=False,
+            include=["reasoning.encrypted_content"],
         )
-        calls = [item for item in response.output if item.type == "function_call"]
-        if not calls:
-            if not response.output_text:
-                raise RuntimeError("Модель не вернула текстовый ответ.")
-            return response.output_text
+        if response.status not in (None, "completed"):
+            raise RuntimeError("Модель не завершила ответ.")
 
-        if step == MAX_STEPS:
+        calls = [item for item in response.output if item.type == "function_call"]
+        if calls and step == MAX_STEPS:
             break
 
-        history.extend(
+        turn.extend(
             item.model_dump(mode="json", by_alias=True, exclude_none=True)
             for item in response.output
         )
+
+        if not calls:
+            answer = response.output_text
+            if not answer.strip():
+                raise RuntimeError("Модель не вернула текстовый ответ.")
+            conversation.commit_turn(revision, turn)
+            return answer
 
         for call in calls:
             tool = tools.get(call.name)
@@ -68,7 +89,7 @@ async def run_agent(
                     except Exception:
                         output = serialize_tool_error("Не удалось получить данные от MCP-инструмента.")
 
-            history.append({
+            turn.append({
                 "type": "function_call_output",
                 "call_id": call.call_id,
                 "output": output,

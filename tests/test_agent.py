@@ -5,9 +5,15 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 from mcp.types import CallToolResult, ListToolsResult, Tool
-from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseReasoningItem,
+)
 
 from src.agent import MAX_STEPS, run_agent
+from src.conversation import Conversation
 
 
 @pytest.fixture
@@ -34,13 +40,27 @@ def tool_call(name, call_id, arguments):
     )
 
 
+def final_response(text):
+    message = ResponseOutputMessage(
+        id="msg_test",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+    )
+    return SimpleNamespace(output=[message], output_text=text)
+
+
 def model_with_responses(*responses):
     history_snapshots = []
     pending = iter(responses)
 
     async def create(**request):
         history_snapshots.append(deepcopy(request["input"]))
-        return next(pending)
+        response = next(pending)
+        if not hasattr(response, "status"):
+            response.status = "completed"
+        return response
 
     client = SimpleNamespace(responses=SimpleNamespace(create=AsyncMock(side_effect=create)))
     return client, history_snapshots
@@ -71,6 +91,8 @@ async def test_agent_forwards_multiple_results_with_matching_call_ids(session):
     ]
     first_request = client.responses.create.await_args_list[0].kwargs
     assert first_request["model"] == "test-model"
+    assert first_request["store"] is False
+    assert first_request["include"] == ["reasoning.encrypted_content"]
     assert {tool["name"] for tool in first_request["tools"]} == {
         "geocode_location", "get_weather_forecast",
     }
@@ -116,9 +138,105 @@ async def test_agent_caps_model_steps_without_unused_final_tool_call(session):
         tool_call("geocode_location", "call_city", '{"name":"Москва"}'),
     ])
     client, _ = model_with_responses(*([response] * MAX_STEPS))
+    conversation = Conversation()
 
-    answer = await run_agent(session, client, model="test-model", question="Погода?")
+    answer = await run_agent(
+        session, client, model="test-model", question="Погода?", conversation=conversation,
+    )
 
     assert answer == "Агент достиг лимита шагов."
     assert client.responses.create.await_count == MAX_STEPS
     assert session.call_tool.await_count == MAX_STEPS - 1
+    assert conversation.snapshot()[1] == []
+
+
+@pytest.mark.asyncio
+async def test_follow_up_receives_previous_city_and_tool_history_until_clear(session):
+    reasoning = ResponseReasoningItem(
+        id="rs_test", type="reasoning", summary=[], encrypted_content="encrypted-test-data",
+    )
+    client, requests = model_with_responses(
+        SimpleNamespace(output=[
+            reasoning,
+            tool_call("geocode_location", "find_city", '{"name":"Москва"}'),
+        ]),
+        final_response("Сейчас в Москве 3 °C."),
+        final_response("Завтра в Москве 5 °C."),
+        final_response("Для какого города нужен прогноз?"),
+    )
+    conversation = Conversation()
+
+    await run_agent(
+        session, client, model="test-model", question="Погода в Москве?", conversation=conversation,
+    )
+    follow_up = await run_agent(
+        session, client, model="test-model", question="А завтра?", conversation=conversation,
+    )
+
+    assert follow_up == "Завтра в Москве 5 °C."
+    assert requests[2][0]["content"] == "Погода в Москве?"
+    assert requests[2][1]["encrypted_content"] == "encrypted-test-data"
+    assert requests[2][2]["call_id"] == requests[2][3]["call_id"] == "find_city"
+    assert requests[2][4]["content"][0]["text"] == "Сейчас в Москве 3 °C."
+    assert requests[2][-1] == {"role": "user", "content": "А завтра?"}
+
+    conversation.clear()
+    after_clear = await run_agent(
+        session, client, model="test-model", question="А завтра?", conversation=conversation,
+    )
+
+    assert after_clear == "Для какого города нужен прогноз?"
+    assert requests[3] == [{"role": "user", "content": "А завтра?"}]
+
+
+@pytest.mark.asyncio
+async def test_agent_passes_clarification_with_original_question(session):
+    client, requests = model_with_responses(
+        final_response("Какой Спрингфилд вы имеете в виду? Укажите штат."),
+        final_response("Завтра в Спрингфилде, Иллинойс, 5 °C."),
+    )
+    conversation = Conversation()
+
+    await run_agent(
+        session, client, model="test-model",
+        question="Какая погода завтра в Спрингфилде?", conversation=conversation,
+    )
+    answer = await run_agent(
+        session, client, model="test-model", question="Иллинойс.", conversation=conversation,
+    )
+
+    assert answer == "Завтра в Спрингфилде, Иллинойс, 5 °C."
+    assert requests[1][0]["content"] == "Какая погода завтра в Спрингфилде?"
+    assert "Укажите штат" in requests[1][1]["content"][0]["text"]
+    assert requests[1][2] == {"role": "user", "content": "Иллинойс."}
+
+
+@pytest.mark.asyncio
+async def test_incomplete_answer_does_not_change_conversation(session):
+    client, requests = model_with_responses(
+        final_response("Сейчас в Москве 3 °C."),
+        SimpleNamespace(output=[
+            tool_call("get_weather_forecast", "forecast", '{"latitude":59.94}'),
+        ]),
+        SimpleNamespace(status="incomplete", output=[], output_text="В Петербурге"),
+        final_response("Завтра в Москве 5 °C."),
+    )
+    conversation = Conversation()
+
+    await run_agent(
+        session, client, model="test-model", question="Погода в Москве?", conversation=conversation,
+    )
+    before = conversation.snapshot()
+    with pytest.raises(RuntimeError, match="не завершила"):
+        await run_agent(
+            session, client, model="test-model",
+            question="Погода в Петербурге?", conversation=conversation,
+        )
+
+    assert conversation.snapshot() == before
+    assert requests[2][-1]["call_id"] == "forecast"
+
+    await run_agent(
+        session, client, model="test-model", question="А завтра?", conversation=conversation,
+    )
+    assert requests[3] == [*before[1], {"role": "user", "content": "А завтра?"}]
