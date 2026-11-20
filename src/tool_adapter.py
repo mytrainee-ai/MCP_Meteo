@@ -1,6 +1,7 @@
 """Преобразование схем и результатов между MCP и Responses API."""
 
 import json
+import math
 from typing import Any
 
 from jsonschema import ValidationError
@@ -9,6 +10,8 @@ from mcp.types import CallToolResult, TextContent, Tool
 from openai.types.responses import FunctionToolParam
 from referencing import Registry
 from referencing.exceptions import Unresolvable
+
+MAX_TOOL_OUTPUT_BYTES = 32 * 1024
 
 
 def to_function_tool(tool: Tool) -> FunctionToolParam:
@@ -21,10 +24,19 @@ def to_function_tool(tool: Tool) -> FunctionToolParam:
     }
 
 
+def parse_finite_float(raw_number: str) -> float:
+    number = float(raw_number)
+    if not math.isfinite(number):
+        raise ValueError("JSON number must be finite")
+    return number
+
+
 def parse_tool_arguments(raw_arguments: str, tool: Tool) -> dict[str, Any]:
     try:
-        arguments = json.loads(raw_arguments)
-    except json.JSONDecodeError:
+        arguments = json.loads(
+            raw_arguments, parse_float=parse_finite_float, parse_constant=parse_finite_float,
+        )
+    except ValueError:
         raise ValueError("Аргументы инструмента должны быть корректным JSON.") from None
 
     if not isinstance(arguments, dict):
@@ -66,4 +78,17 @@ def serialize_mcp_result(result: CallToolResult) -> str:
             return serialize_tool_error("Ответ MCP-инструмента не содержит JSON.")
         data = parsed_blocks[0] if len(parsed_blocks) == 1 else parsed_blocks
 
-    return json.dumps({"is_error": False, "data": data}, ensure_ascii=False)
+    try:
+        output = json.dumps(
+            {"is_error": False, "data": data},
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        size = len(output.encode("utf-8"))
+    except (TypeError, ValueError):
+        return serialize_tool_error("Ответ MCP-инструмента не удалось преобразовать в JSON.")
+
+    if size > MAX_TOOL_OUTPUT_BYTES:
+        return serialize_tool_error("Ответ MCP-инструмента слишком большой. Запросите меньше данных.")
+    return output

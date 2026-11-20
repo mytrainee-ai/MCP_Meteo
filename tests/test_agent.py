@@ -151,6 +151,45 @@ async def test_agent_caps_model_steps_without_unused_final_tool_call(session):
 
 
 @pytest.mark.asyncio
+async def test_agent_caps_actual_mcp_attempts_across_steps(session):
+    session.call_tool.side_effect = RuntimeError("MCP request failed")
+    client, requests = model_with_responses(
+        SimpleNamespace(output=[
+            tool_call("geocode_location", "invalid", '{"name":77}'),
+            tool_call("geocode_location", "attempt", '{"name":"Москва"}'),
+        ]),
+        SimpleNamespace(output=[tool_call("get_weather_forecast", "over_limit", "{}")]),
+    )
+    conversation = Conversation()
+
+    answer = await run_agent(
+        session, client, model="test-model", question="Погода?",
+        conversation=conversation, max_tool_calls=1,
+    )
+
+    assert answer == "Агент достиг лимита вызовов MCP."
+    session.call_tool.assert_awaited_once_with("geocode_location", arguments={"name": "Москва"})
+    assert len(requests) == 2
+    assert conversation.snapshot()[1] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_can_finish_after_last_allowed_mcp_call(session):
+    client, _ = model_with_responses(
+        SimpleNamespace(output=[tool_call("get_weather_forecast", "forecast", "{}")]),
+        final_response("Завтра 5 °C."),
+    )
+
+    answer = await run_agent(
+        session, client, model="test-model", question="А завтра?",
+        max_steps=2, max_tool_calls=1,
+    )
+
+    assert answer == "Завтра 5 °C."
+    session.call_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_follow_up_receives_previous_city_and_tool_history_until_clear(session):
     reasoning = ResponseReasoningItem(
         id="rs_test", type="reasoning", summary=[], encrypted_content="encrypted-test-data",

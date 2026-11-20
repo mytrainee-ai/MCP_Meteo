@@ -1,9 +1,13 @@
 """Цикл Responses API с вызовом погодных MCP-инструментов."""
 
+import logging
+from dataclasses import dataclass
+
 from mcp import ClientSession
 from openai import AsyncOpenAI
 from openai.types.responses import ResponseInputParam
 
+from .config import MAX_STEPS, MAX_TOOL_CALLS
 from .conversation import Conversation
 from .mcp_client import list_weather_tools
 from .tool_adapter import (
@@ -13,7 +17,7 @@ from .tool_adapter import (
     to_function_tool,
 )
 
-MAX_STEPS = 6
+logger = logging.getLogger(__name__)
 INSTRUCTIONS = (
     "Ты AI-агент погоды. Отвечай на русском языке. "
     "Для погодных вопросов используй MCP-инструменты. "
@@ -27,25 +31,32 @@ INSTRUCTIONS = (
 )
 
 
-async def run_agent(
+@dataclass(frozen=True)
+class TurnResult:
+    text: str
+    items: ResponseInputParam | None = None
+
+
+async def generate_turn(
     session: ClientSession,
     client: AsyncOpenAI,
     *,
     model: str,
     question: str,
-    conversation: Conversation | None = None,
-) -> str:
-    """Обрабатывает вопрос и сохраняет обмен после получения полного ответа."""
+    history: ResponseInputParam,
+    max_steps: int,
+    max_tool_calls: int,
+) -> TurnResult:
+    """Готовит обмен для записи после завершения внешних операций."""
 
-    if conversation is None:
-        conversation = Conversation()
-    revision, history = conversation.snapshot()
     turn: ResponseInputParam = [{"role": "user", "content": question}]
+    tool_calls = 0
 
     tools = await list_weather_tools(session)
     function_tools = [to_function_tool(tool) for tool in tools.values()]
 
-    for step in range(1, MAX_STEPS + 1):
+    for step in range(1, max_steps + 1):
+        logger.debug("Шаг Responses API %d из %d.", step, max_steps)
         response = await client.responses.create(
             model=model,
             instructions=INSTRUCTIONS,
@@ -58,7 +69,7 @@ async def run_agent(
             raise RuntimeError("Модель не завершила ответ.")
 
         calls = [item for item in response.output if item.type == "function_call"]
-        if calls and step == MAX_STEPS:
+        if calls and step == max_steps:
             break
 
         turn.extend(
@@ -70,8 +81,7 @@ async def run_agent(
             answer = response.output_text
             if not answer.strip():
                 raise RuntimeError("Модель не вернула текстовый ответ.")
-            conversation.commit_turn(revision, turn)
-            return answer
+            return TurnResult(answer, turn)
 
         for call in calls:
             tool = tools.get(call.name)
@@ -83,10 +93,16 @@ async def run_agent(
                 except ValueError as error:
                     output = serialize_tool_error(str(error))
                 else:
+                    if tool_calls >= max_tool_calls:
+                        logger.debug("Достигнут лимит MCP-вызовов (%d).", max_tool_calls)
+                        return TurnResult("Агент достиг лимита вызовов MCP.")
+                    tool_calls += 1
+                    logger.debug("MCP-вызов %d из %d: %s.", tool_calls, max_tool_calls, tool.name)
                     try:
                         result = await session.call_tool(call.name, arguments=arguments)
                         output = serialize_mcp_result(result)
-                    except Exception:
+                    except Exception as error:
+                        logger.debug("Ошибка MCP-вызова: %s.", type(error).__name__)
                         output = serialize_tool_error("Не удалось получить данные от MCP-инструмента.")
 
             turn.append({
@@ -95,4 +111,29 @@ async def run_agent(
                 "output": output,
             })
 
-    return "Агент достиг лимита шагов."
+    logger.debug("Достигнут лимит шагов Responses API (%d).", max_steps)
+    return TurnResult("Агент достиг лимита шагов.")
+
+
+async def run_agent(
+    session: ClientSession,
+    client: AsyncOpenAI,
+    *,
+    model: str,
+    question: str,
+    conversation: Conversation | None = None,
+    max_steps: int = MAX_STEPS,
+    max_tool_calls: int = MAX_TOOL_CALLS,
+) -> str:
+    """Обрабатывает вопрос, используя предоставленные клиентские сессии."""
+
+    if conversation is None:
+        conversation = Conversation()
+    revision, history = conversation.snapshot()
+    result = await generate_turn(
+        session, client, model=model, question=question, history=history,
+        max_steps=max_steps, max_tool_calls=max_tool_calls,
+    )
+    if result.items is not None:
+        conversation.commit_turn(revision, result.items)
+    return result.text

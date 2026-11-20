@@ -95,6 +95,18 @@ def test_streamlit_handles_service_error_and_can_continue(weather_reply):
     assert app.markdown[-1].value == "Уточните город."
 
 
+def test_streamlit_shows_timeout_as_a_retryable_error(weather_reply):
+    app = AppTest.from_file(APP_PATH).run()
+    weather_reply.side_effect = TimeoutError("Private timeout diagnostic")
+
+    app.chat_input[0].set_value("Погода в Москве?").run()
+
+    assert not app.exception
+    assert app.error[0].value.startswith("Превышено время ожидания")
+    assert "Private timeout diagnostic" not in app.error[0].value
+    assert not app.chat_input[0].proto.disabled
+
+
 def test_streamlit_shows_missing_settings_and_disables_input(monkeypatch):
     monkeypatch.setattr(config, "load_dotenv", lambda _: None)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

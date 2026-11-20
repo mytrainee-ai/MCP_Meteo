@@ -4,7 +4,13 @@ import asyncio
 from typing import Literal, NotRequired, TypedDict
 
 import streamlit as st
-from openai import AuthenticationError, OpenAIError, PermissionDeniedError, RateLimitError
+from openai import (
+    APITimeoutError,
+    AuthenticationError,
+    OpenAIError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from src import config, service
 from src.conversation import Conversation
@@ -42,6 +48,8 @@ def render_message(message: ChatMessage) -> None:
 def get_reply(question: str, settings: config.Settings, conversation: Conversation) -> ChatMessage:
     try:
         answer = asyncio.run(service.answer_question(question, settings, conversation))
+    except (TimeoutError, APITimeoutError):
+        error = "Превышено время ожидания прогноза. Попробуйте отправить вопрос ещё раз."
     except (AuthenticationError, PermissionDeniedError):
         error = "Провайдер отклонил доступ. Проверьте ключ API и доступ к выбранной модели."
     except RateLimitError:
