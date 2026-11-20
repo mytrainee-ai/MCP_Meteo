@@ -6,7 +6,7 @@ if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
 
 Push-Location -LiteralPath $PSScriptRoot
 try {
-    & $pythonPath -m src.cli
+    & $pythonPath -m streamlit run streamlit_app.py --server.address=127.0.0.1 --browser.gatherUsageStats=false
     exit $LASTEXITCODE
 }
 finally {
